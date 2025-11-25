@@ -4,9 +4,77 @@ import torch.nn as nn
 import torch.nn.utils.prune as prune
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import argparse
+import torch
+import time
 
+'''
+Note that this is not structrual pruning, so the peak_reserved memory,
+does not reflect the real memory consumption during training.
+And peak_alloc memory, which also won't noticiably reduce, is the real usage of memory for running inference,
+since weight pruning does not modify the shape of tensors, just setting some value to zero. 
+
+To use, run python this.py --amount 0<n<1
+'''
 
 MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+def to_mb(bytes_val):
+    return bytes_val / (1024 ** 2)
+
+
+@torch.no_grad()
+def benchmark_inference(model, tokenizer, device, prompts: list[str], max_new_tokens=64, warmup=1, runs=3):
+    model.eval()
+    device = torch.device(device)
+
+    for _ in range(warmup):
+        for text in prompts:
+            inputs = tokenizer(text, return_tensors="pt").to(device)
+            _ = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
+    torch.cuda.synchronize(device)
+
+    torch.cuda.reset_peak_memory_stats(device)
+
+    total_tokens = 0
+    total_time = 0
+
+    for _ in range(runs):
+        for text in prompts:
+            inputs = tokenizer(text, return_tensors="pt").to(device)
+            input_len = inputs["input_ids"].shape[1]
+
+            torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
+
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
+            torch.cuda.synchronize(device)
+            t1 = time.perf_counter()
+
+            gen_len = output_ids.shape[1] - input_len
+            total_tokens += gen_len
+            total_time += (t1 - t0)
+
+    tokens_per_sec = total_tokens / total_time if total_time > 0 else 0.0
+    peak_alloc = to_mb(torch.cuda.max_memory_allocated(device))
+    peak_reserved = to_mb(torch.cuda.max_memory_reserved(device))
+
+    return {
+        "tokens_per_sec": tokens_per_sec,
+        "total_tokens": total_tokens,
+        "total_time": total_time,
+        "peak_alloc_mb": peak_alloc,
+        "peak_reserved_mb": peak_reserved,
+    }
+
+
 
 
 def load_model_and_tokenizer():
@@ -130,14 +198,33 @@ def main():
         "The patient was diagnosed with type 2 diabetes.",
         "Sorting algorithms include quicksort and mergesort.",
         "Large language models can be compressed using pruning.",
+        "ADHD is triggered by long-time use of computers and can be reduced by driving."
     ]
 
     print("\n=== BEFORE PRUNING ===")
     loss1, ppl1 = evaluate_ppl(model, tokenizer, val_texts, device)
     print(f"Loss: {loss1:.4f}, PPL: {ppl1:.2f}")
 
-    prompt = "What does pruning do to a neural network?"
-    print("\nSample BEFORE pruning:\n", generate_sample(model, tokenizer, device, prompt))
+    # prompt = "What does pruning do to a neural network?"
+    # print("\nSample BEFORE pruning:\n", generate_sample(model, tokenizer, device, prompt))
+
+    bench_prompts = [
+        "Explain what pruning does to a neural network in simple terms.",
+        "Describe the main differences between supervised and unsupervised learning.",
+        "Give an example of recovering from severe trauma.",
+    ]
+
+    bench_before = benchmark_inference(
+        model, tokenizer, device,
+        prompts = bench_prompts,
+        max_new_tokens=64,
+        warmup=1,
+        runs=3,
+    )
+
+    print(f"[Benchmark BEFORE] tokens/s = {bench_before['tokens_per_sec']:.2f}, "
+          f"peak_alloc = {bench_before['peak_alloc_mb']:.1f} MB, "
+          f"peak_reserved = {bench_before['peak_reserved_mb']:.1f} MB")
 
     # torch.cuda.empty_cache()
     model = prune_model_global_l1(model, amount=args.amount)
@@ -150,7 +237,18 @@ def main():
     loss2, ppl2 = evaluate_ppl(model, tokenizer, val_texts, device)
     print(f"Loss: {loss2:.4f}, PPL: {ppl2:.2f}")
 
-    print("\nSample AFTER pruning:\n", generate_sample(model, tokenizer, device, prompt))
+    # print("\nSample AFTER pruning:\n", generate_sample(model, tokenizer, device, prompt))
+
+    bench_after = benchmark_inference(
+        model, tokenizer, device,
+        prompts=bench_prompts,
+        max_new_tokens=64,
+        warmup=1,
+        runs=3,
+    )
+    print(f"[Benchmark AFTER]  tokens/s = {bench_after['tokens_per_sec']:.2f}, "
+            f"peak_alloc = {bench_after['peak_alloc_mb']:.1f} MB, "
+            f"peak_reserved = {bench_after['peak_reserved_mb']:.1f} MB")
 
 
 if __name__ == "__main__":
